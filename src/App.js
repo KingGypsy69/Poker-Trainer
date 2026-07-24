@@ -1,10 +1,18 @@
-import { useState, useCallback } from "react";
+import React, { useState } from "react";
 
+// ─── Constants ────────────────────────────────────────────────────────────────
 const RANKS = ["A","K","Q","J","T","9","8","7","6","5","4","3","2"];
 const SUITS = ["s","h","d","c"];
 const SUIT_SYMS = { s:"♠", h:"♥", d:"♦", c:"♣" };
 const SUIT_COLORS = { s:"#cbd5e1", h:"#f87171", d:"#f87171", c:"#4ade80" };
-const POSITIONS = ["UTG","UTG+1","MP","HJ","CO","BTN","SB","BB"];
+
+// Position order from earliest to latest (BTN acts last preflop after blinds)
+const POS_ORDER = ["UTG","UTG+1","MP","HJ","CO","BTN","SB","BB"];
+
+// Positions that are IN POSITION postflop (act last)
+const IP_POSITIONS = ["BTN","CO","HJ"];
+// Positions that are OUT OF POSITION postflop (act first)
+const OOP_POSITIONS = ["SB","BB","UTG","UTG+1","MP"];
 
 const MODULES = [
   { id:"preflop", label:"Preflop", icon:"🃏", desc:"Open ranges, 3bets, fold decisions" },
@@ -15,30 +23,62 @@ const MODULES = [
   { id:"scenario", label:"Full Hand", icon:"🏆", desc:"Play a full hand street by street" },
 ];
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 function randFrom(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+
 function randCard(exclude=[]) {
-  let card;
-  do { card = randFrom(RANKS) + randFrom(SUITS); } while (exclude.includes(card));
+  let card, attempts = 0;
+  do {
+    card = randFrom(RANKS) + randFrom(SUITS);
+    attempts++;
+    if(attempts > 100) break;
+  } while (exclude.includes(card));
   return card;
 }
+
 function randHand(exclude=[]) {
   const c1 = randCard(exclude);
   const c2 = randCard([...exclude, c1]);
   return [c1, c2];
 }
+
 function randBoard(n=3, exclude=[]) {
   const board = [];
-  for(let i=0;i<n;i++) board.push(randCard([...exclude,...board]));
+  for(let i=0;i<n;i++) {
+    board.push(randCard([...exclude,...board]));
+  }
   return board;
 }
+
 function handStr([c1,c2]) {
   const r1=c1[0],r2=c2[0],s1=c1[1],s2=c2[1];
   const order="AKQJT98765432";
-  const suited=s1===s2, pair=r1===r2;
+  const suited=s1===s2,pair=r1===r2;
   if(pair) return `${r1}${r2}`;
   const [hi,lo]=order.indexOf(r1)<order.indexOf(r2)?[r1,r2]:[r2,r1];
   return `${hi}${lo}${suited?"s":"o"}`;
 }
+
+// Get a villain position that makes sense relative to hero
+// If hero is IP, villain should be OOP (acted before hero preflop)
+// If hero is OOP, villain should be IP (acted after hero preflop)
+function getVillainPos(heroPos) {
+  if(IP_POSITIONS.includes(heroPos)) {
+    // Hero is IP — villain is earlier position (OOP postflop)
+    const heroIdx = POS_ORDER.indexOf(heroPos);
+    const candidates = POS_ORDER.slice(0, heroIdx).filter(p => p !== "SB" || heroPos !== "BB");
+    return candidates.length > 0 ? randFrom(candidates) : randFrom(["UTG","MP","BB"]);
+  } else {
+    // Hero is OOP — villain is later position (IP postflop)
+    return randFrom(IP_POSITIONS);
+  }
+}
+
+// Determine who acts first postflop
+function heroActsFirst(heroPos) {
+  return OOP_POSITIONS.includes(heroPos);
+}
+
 function Card({card, size=24}) {
   const rank=card[0], suit=card[1];
   return (
@@ -53,44 +93,48 @@ function Card({card, size=24}) {
 
 // ─── API Call ─────────────────────────────────────────────────────────────────
 async function askClaude(prompt, apiKey) {
-  if(!apiKey) return "⚠️ No API key set — enter your key in settings.";
+  if(!apiKey) return "⚠️ No API key set — tap Setup to add your Anthropic API key.";
   try {
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method:"POST",
-      headers:{"Content-Type":"application/json","x-api-key":apiKey,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
+      headers:{
+        "Content-Type":"application/json",
+        "x-api-key":apiKey,
+        "anthropic-version":"2023-06-01",
+        "anthropic-dangerous-direct-browser-access":"true"
+      },
       body: JSON.stringify({
         model:"claude-sonnet-4-6",
         max_tokens:300,
         system:`You are a poker coach for kingygpsy, a tournament NLH player.
-Known leaks: calling too much preflop (VPIP/PFR gap too wide), missing BTN/CO steal spots, SB not raising enough, trash hand shoves when short stacked, going too far with top pair weak kicker.
-Known strengths: live reads, range reading, bluffing with range advantage, postflop in deep stack spots.
-Give concise direct feedback. Max 120 words. Be specific with numbers. Call out leaks when relevant.`,
+Known leaks: calling too much preflop (VPIP/PFR gap too wide), missing BTN/CO steal spots, SB not raising enough vs late position, trash hand shoves when short stacked, going too far with top pair weak kicker (e.g. AJ facing 3bet flop aggression).
+Known strengths: live reads, range reading, bluffing with range advantage, postflop play when deep stacked, reading board texture.
+Give concise direct feedback. Max 120 words. Be specific with numbers. Call out leaks when relevant. Always state the correct action clearly.`,
         messages:[{role:"user",content:prompt}]
       })
     });
     const data = await response.json();
-    if(data.error) return `Error: ${data.error.message}`;
-    return data.content?.[0]?.text || "No response";
+    if(data.error) return `API Error: ${data.error.message}`;
+    return data.content?.[0]?.text || "No response received.";
   } catch(e) {
     return `Connection error: ${e.message}`;
   }
 }
 
-// ─── Settings Panel ───────────────────────────────────────────────────────────
+// ─── Settings ─────────────────────────────────────────────────────────────────
 function Settings({ apiKey, setApiKey, onClose }) {
   const [input, setInput] = useState(apiKey);
   const [visible, setVisible] = useState(false);
   return (
-    <div style={{background:"#0f172a",minHeight:"100vh",padding:16}}>
+    <div style={{background:"#0f172a",minHeight:"100vh",padding:16,color:"#e2e8f0",fontFamily:"'Inter','Helvetica Neue',sans-serif"}}>
       <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:16}}>
         <button onClick={onClose} style={{background:"#1e293b",border:"1px solid #334155",color:"#94a3b8",borderRadius:6,padding:"5px 10px",fontSize:11,cursor:"pointer"}}>← Back</button>
         <div style={{fontSize:14,fontWeight:700,color:"#f8fafc"}}>⚙️ Settings</div>
       </div>
       <div style={{background:"#1e293b",borderRadius:10,padding:14,marginBottom:12}}>
         <div style={{fontSize:11,color:"#16a34a",fontWeight:700,marginBottom:4,textTransform:"uppercase",letterSpacing:1}}>Anthropic API Key</div>
-        <div style={{fontSize:11,color:"#64748b",marginBottom:10,lineHeight:1.5}}>
-          Get your key from <span style={{color:"#60a5fa"}}>console.anthropic.com</span> → API Keys → Create new key.
-          Your key is stored only in this session and never sent anywhere except Anthropic's API.
+        <div style={{fontSize:11,color:"#64748b",marginBottom:10,lineHeight:1.6}}>
+          Get your key from <span style={{color:"#60a5fa"}}>console.anthropic.com</span> → API Keys → Create new key. Your key is only stored in this session.
         </div>
         <div style={{display:"flex",gap:6,marginBottom:8}}>
           <input
@@ -98,20 +142,11 @@ function Settings({ apiKey, setApiKey, onClose }) {
             value={input}
             onChange={e=>setInput(e.target.value)}
             placeholder="sk-ant-..."
-            style={{
-              flex:1,background:"#0f172a",border:"1px solid #334155",borderRadius:7,
-              padding:"8px 10px",color:"#e2e8f0",fontSize:11,outline:"none",
-            }}
+            style={{flex:1,background:"#0f172a",border:"1px solid #334155",borderRadius:7,padding:"8px 10px",color:"#e2e8f0",fontSize:11,outline:"none"}}
           />
-          <button onClick={()=>setVisible(v=>!v)} style={{
-            background:"#1e293b",border:"1px solid #334155",color:"#94a3b8",
-            borderRadius:7,padding:"8px 10px",fontSize:11,cursor:"pointer",
-          }}>{visible?"Hide":"Show"}</button>
+          <button onClick={()=>setVisible(v=>!v)} style={{background:"#1e293b",border:"1px solid #334155",color:"#94a3b8",borderRadius:7,padding:"8px 10px",fontSize:11,cursor:"pointer"}}>{visible?"Hide":"Show"}</button>
         </div>
-        <button onClick={()=>{setApiKey(input);onClose();}} style={{
-          width:"100%",background:"#16a34a",color:"#fff",border:"none",
-          borderRadius:7,padding:"9px 0",fontSize:12,fontWeight:700,cursor:"pointer",
-        }}>Save Key</button>
+        <button onClick={()=>{setApiKey(input);onClose();}} style={{width:"100%",background:"#16a34a",color:"#fff",border:"none",borderRadius:7,padding:"9px 0",fontSize:12,fontWeight:700,cursor:"pointer"}}>Save Key</button>
       </div>
       <div style={{background:"#1e293b",borderRadius:10,padding:12}}>
         <div style={{fontSize:10,color:"#64748b",marginBottom:6,textTransform:"uppercase",letterSpacing:1}}>Cost Estimate</div>
@@ -119,7 +154,7 @@ function Settings({ apiKey, setApiKey, onClose }) {
           Each feedback call: ~$0.003–0.005<br/>
           20 drills per session: ~$0.06–0.10<br/>
           Full month of daily drilling: ~$1–3<br/>
-          <span style={{color:"#16a34a"}}>Very cheap — $5 credit lasts months</span>
+          <span style={{color:"#16a34a"}}>$5 credit lasts months of drilling</span>
         </div>
       </div>
     </div>
@@ -139,18 +174,20 @@ function PreflopModule({ apiKey }) {
     setHand(randHand());
     setChoice(null);
     setFeedback(null);
-    const hasPrior = Math.random() > 0.5;
-    const priorPositions = POSITIONS.slice(0, POSITIONS.indexOf(pos));
-    setRaiserPos(hasPrior && priorPositions.length > 0 ? randFrom(priorPositions) : null);
+    // Only show a raiser if they are in an earlier position than hero
+    const heroIdx = POS_ORDER.indexOf(pos);
+    const earlierPos = POS_ORDER.slice(0, heroIdx);
+    const hasPrior = Math.random() > 0.4 && earlierPos.length > 0;
+    setRaiserPos(hasPrior ? randFrom(earlierPos) : null);
   };
 
   const decide = async (action) => {
     setChoice(action);
     setLoading(true);
     const context = raiserPos
-      ? `${pos} facing raise from ${raiserPos}. Hand: ${handStr(hand)} (${hand.join(" ")}). Action: ${action}.`
-      : `${pos} first in. Hand: ${handStr(hand)} (${hand.join(" ")}). Action: ${action}.`;
-    const fb = await askClaude(`Evaluate preflop: ${context}. Correct? What should they do and why?`, apiKey);
+      ? `Hero at ${pos} facing a raise from ${raiserPos}. Hand: ${handStr(hand)} (${hand.join(" ")}). Hero chose: ${action}.`
+      : `Hero at ${pos}, folded to hero (first in). Hand: ${handStr(hand)} (${hand.join(" ")}). Hero chose: ${action}.`;
+    const fb = await askClaude(`Evaluate this preflop decision: ${context}. Is this correct GTO/exploitative play? State the correct action clearly. Note any relevant leaks.`, apiKey);
     setFeedback(fb);
     setLoading(false);
   };
@@ -162,9 +199,9 @@ function PreflopModule({ apiKey }) {
   return (
     <div>
       <div style={{marginBottom:10}}>
-        <div style={{fontSize:10,color:"#64748b",marginBottom:4,textTransform:"uppercase",letterSpacing:1}}>Position</div>
+        <div style={{fontSize:10,color:"#64748b",marginBottom:4,textTransform:"uppercase",letterSpacing:1}}>Your Position</div>
         <div style={{display:"flex",flexWrap:"wrap",gap:3}}>
-          {POSITIONS.map(p=>(
+          {POS_ORDER.map(p=>(
             <button key={p} onClick={()=>{setPos(p);setHand(null);setFeedback(null);setRaiserPos(null);}} style={{
               padding:"4px 8px",borderRadius:5,border:"none",cursor:"pointer",fontSize:11,fontWeight:600,
               background:pos===p?"#16a34a":"#1e293b",color:pos===p?"#fff":"#94a3b8"
@@ -176,17 +213,27 @@ function PreflopModule({ apiKey }) {
       {hand && (
         <div>
           <div style={{background:"#1e293b",borderRadius:10,padding:12,marginBottom:10,textAlign:"center"}}>
-            <div style={{fontSize:10,color:"#64748b",marginBottom:6}}>{raiserPos?`${raiserPos} raised — your action at ${pos}`:`Folded to you at ${pos}`}</div>
+            <div style={{fontSize:10,color:"#64748b",marginBottom:6}}>
+              {raiserPos ? `${raiserPos} raised — your action at ${pos}` : `Folded to you at ${pos} — first in`}
+            </div>
             <div style={{fontSize:26,marginBottom:4}}>{hand.map((c,i)=><Card key={i} card={c} size={26}/>)}</div>
             <div style={{fontSize:13,fontWeight:700,color:"#e2e8f0"}}>{handStr(hand)}</div>
           </div>
-          {!choice && <div style={{display:"grid",gridTemplateColumns:`repeat(${actions.length},1fr)`,gap:6}}>{actions.map(([label,color])=><button key={label} onClick={()=>decide(label)} style={{background:color,color:"#fff",border:"none",borderRadius:8,padding:"10px 0",fontSize:12,fontWeight:700,cursor:"pointer"}}>{label}</button>)}</div>}
+          {!choice && (
+            <div style={{display:"grid",gridTemplateColumns:`repeat(${actions.length},1fr)`,gap:6}}>
+              {actions.map(([label,color])=>(
+                <button key={label} onClick={()=>decide(label)} style={{background:color,color:"#fff",border:"none",borderRadius:8,padding:"10px 0",fontSize:12,fontWeight:700,cursor:"pointer"}}>{label}</button>
+              ))}
+            </div>
+          )}
           {loading && <div style={{textAlign:"center",padding:12,color:"#64748b",fontSize:11}}>Analysing...</div>}
-          {feedback && <div style={{background:"#1e293b",borderRadius:10,padding:12,marginTop:8,borderLeft:"3px solid #16a34a"}}>
-            <div style={{fontSize:10,color:"#16a34a",fontWeight:700,marginBottom:5,textTransform:"uppercase",letterSpacing:1}}>Coach</div>
-            <div style={{fontSize:12,color:"#e2e8f0",lineHeight:1.5}}>{feedback}</div>
-            <button onClick={deal} style={{marginTop:8,background:"#16a34a",color:"#fff",border:"none",borderRadius:6,padding:"5px 14px",fontSize:11,fontWeight:700,cursor:"pointer"}}>Next →</button>
-          </div>}
+          {feedback && (
+            <div style={{background:"#1e293b",borderRadius:10,padding:12,marginTop:8,borderLeft:"3px solid #16a34a"}}>
+              <div style={{fontSize:10,color:"#16a34a",fontWeight:700,marginBottom:5,textTransform:"uppercase",letterSpacing:1}}>Coach</div>
+              <div style={{fontSize:12,color:"#e2e8f0",lineHeight:1.5}}>{feedback}</div>
+              <button onClick={deal} style={{marginTop:8,background:"#16a34a",color:"#fff",border:"none",borderRadius:6,padding:"5px 14px",fontSize:11,fontWeight:700,cursor:"pointer"}}>Next →</button>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -201,28 +248,41 @@ function CbetModule({ apiKey }) {
   const [loading, setLoading] = useState(false);
 
   const deal = () => {
-    const heroPos = randFrom(["BTN","CO","HJ","SB","BB"]);
+    // Hero is always the preflop raiser and in position postflop for cbet spots
+    const heroPos = randFrom(IP_POSITIONS);
     const hand = randHand();
     const board = randBoard(3, hand);
     const pot = Math.floor(Math.random()*15)+5;
-    setState({ heroPos, hand, board, pot, villainPos: randFrom(POSITIONS.filter(p=>p!==heroPos)), villainChecked: Math.random()>0.4 });
+    const villainPos = getVillainPos(heroPos);
+    setState({
+      heroPos, hand, board, pot, villainPos,
+      // Villain always checks to hero since hero is IP
+      villainChecked: true,
+      street: "Flop"
+    });
     setChoice(null); setFeedback(null);
   };
 
   const decide = async (action) => {
     setChoice(action);
     setLoading(true);
-    const fb = await askClaude(`Cbet spot: ${state.heroPos} with ${handStr(state.hand)} (${state.hand.join(" ")}). Board: ${state.board.join(" ")}. Pot: ${state.pot}BB. Villain ${state.villainChecked?"checked":"in hand"}. Chose: ${action}. Evaluate sizing and board texture.`, apiKey);
+    const fb = await askClaude(
+      `Cbet decision: Hero raised preflop, now at ${state.heroPos} (in position) with ${handStr(state.hand)} (${state.hand.join(" ")}). ` +
+      `Board: ${state.board.join(" ")}. Pot: ${state.pot}BB. Villain (${state.villainPos}) checked to hero. ` +
+      `Hero chose: ${action}. Evaluate: correct to cbet or check? Right sizing? Board texture analysis (wet/dry, range advantage)?`,
+      apiKey
+    );
     setFeedback(fb);
     setLoading(false);
   };
 
   return (
     <div>
-      <button onClick={deal} style={{width:"100%",background:"linear-gradient(135deg,#2563eb,#1d4ed8)",color:"#fff",border:"none",borderRadius:8,padding:"10px 0",fontSize:13,fontWeight:700,cursor:"pointer",marginBottom:10}}>Generate Spot</button>
+      <button onClick={deal} style={{width:"100%",background:"linear-gradient(135deg,#2563eb,#1d4ed8)",color:"#fff",border:"none",borderRadius:8,padding:"10px 0",fontSize:13,fontWeight:700,cursor:"pointer",marginBottom:10}}>Generate C-Bet Spot</button>
       {state && (
         <div>
           <div style={{background:"#1e293b",borderRadius:10,padding:12,marginBottom:10}}>
+            <div style={{fontSize:10,color:"#2563eb",textTransform:"uppercase",letterSpacing:1,marginBottom:6}}>You raised preflop — in position vs {state.villainPos}</div>
             <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
               <div>
                 <div style={{fontSize:10,color:"#64748b",marginBottom:3}}>Hand at {state.heroPos}</div>
@@ -234,23 +294,31 @@ function CbetModule({ apiKey }) {
                 <div style={{fontSize:18,fontWeight:700,color:"#16a34a"}}>{state.pot}BB</div>
               </div>
             </div>
-            <div style={{textAlign:"center"}}>
+            <div style={{textAlign:"center",marginBottom:6}}>
               <div style={{fontSize:10,color:"#64748b",marginBottom:4}}>Flop</div>
               <div>{state.board.map((c,i)=><Card key={i} card={c} size={22}/>)}</div>
-              <div style={{fontSize:11,color:"#64748b",marginTop:6}}>Villain ({state.villainPos}) {state.villainChecked?"checked":"in hand"}</div>
+              <div style={{fontSize:11,color:"#64748b",marginTop:6}}>Villain ({state.villainPos}) checked to you</div>
             </div>
           </div>
-          {!choice && <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:5}}>
-            {["Check","1/3 Pot","1/2 Pot","2/3 Pot","Pot","All-in"].map(s=>(
-              <button key={s} onClick={()=>decide(s)} style={{background:s==="Check"?"#1e293b":s==="All-in"?"#7f1d1d":"#16a34a",color:s==="Check"?"#94a3b8":"#fff",border:"1px solid #334155",borderRadius:7,padding:"8px 4px",fontSize:11,fontWeight:700,cursor:"pointer"}}>{s}</button>
-            ))}
-          </div>}
-          {loading && <div style={{textAlign:"center",padding:12,color:"#64748b",fontSize:11}}>Analysing...</div>}
-          {feedback && <div style={{background:"#1e293b",borderRadius:10,padding:12,marginTop:8,borderLeft:"3px solid #2563eb"}}>
-            <div style={{fontSize:10,color:"#2563eb",fontWeight:700,marginBottom:5,textTransform:"uppercase",letterSpacing:1}}>Coach</div>
-            <div style={{fontSize:12,color:"#e2e8f0",lineHeight:1.5}}>{feedback}</div>
-            <button onClick={deal} style={{marginTop:8,background:"#2563eb",color:"#fff",border:"none",borderRadius:6,padding:"5px 14px",fontSize:11,fontWeight:700,cursor:"pointer"}}>Next →</button>
-          </div>}
+          {!choice && (
+            <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:5}}>
+              {["Check","1/3 Pot","1/2 Pot","2/3 Pot","Pot","All-in"].map(s=>(
+                <button key={s} onClick={()=>decide(s)} style={{
+                  background:s==="Check"?"#1e293b":s==="All-in"?"#7f1d1d":"#16a34a",
+                  color:s==="Check"?"#94a3b8":"#fff",border:"1px solid #334155",
+                  borderRadius:7,padding:"8px 4px",fontSize:11,fontWeight:700,cursor:"pointer"
+                }}>{s}</button>
+              ))}
+            </div>
+          )}
+          {loading && <div style={{textAlign:"center",padding:12,color:"#64748b",fontSize:11}}>Analysing board texture...</div>}
+          {feedback && (
+            <div style={{background:"#1e293b",borderRadius:10,padding:12,marginTop:8,borderLeft:"3px solid #2563eb"}}>
+              <div style={{fontSize:10,color:"#2563eb",fontWeight:700,marginBottom:5,textTransform:"uppercase",letterSpacing:1}}>Coach</div>
+              <div style={{fontSize:12,color:"#e2e8f0",lineHeight:1.5}}>{feedback}</div>
+              <button onClick={deal} style={{marginTop:8,background:"#2563eb",color:"#fff",border:"none",borderRadius:6,padding:"5px 14px",fontSize:11,fontWeight:700,cursor:"pointer"}}>Next →</button>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -266,9 +334,20 @@ function RangeModule({ apiKey }) {
   const [loading, setLoading] = useState(false);
 
   const deal = () => {
+    const pos = randFrom(POS_ORDER);
+    const actions = randFrom([
+      "raises preflop then cbets flop when checked to",
+      "3bets preflop then jams flop",
+      "limps preflop then check-raises flop",
+      "raises preflop, checks flop, bets turn",
+      "open shoves 10BB from this position",
+      "min-raises preflop twice",
+      "calls a 3bet then check-raises flop",
+      "raises preflop, cbets flop, checks turn, bets river",
+    ]);
     setState({
-      pos: randFrom(POSITIONS),
-      action: randFrom(["raises preflop then cbets flop","3bets preflop","limps then raises flop","raises, checks flop, bets turn","open shoves 10BB","min-raises twice","calls 3bet then check-raises flop"]),
+      pos,
+      action: actions,
       board: randBoard(3),
       stack: randFrom(["8BB","15BB","25BB","40BB","80BB"]),
     });
@@ -277,13 +356,19 @@ function RangeModule({ apiKey }) {
 
   const submit = async () => {
     setSubmitted(true); setLoading(true);
-    const fb = await askClaude(`Range read: ${state.pos} (${state.stack}) ${state.action}. Board: ${state.board.join(" ")}. Student read: "${guess}". Evaluate accuracy, give correct range, explain why hands are in/out, how to exploit.`, apiKey);
+    const fb = await askClaude(
+      `Range reading exercise. Villain position: ${state.pos}. Stack: ${state.stack}. ` +
+      `Action: villain ${state.action}. Board: ${state.board.join(" ")}. ` +
+      `Student's range read: "${guess}". ` +
+      `Evaluate: 1) How accurate is the read? 2) What is the correct range? 3) Why are certain hands in/out? 4) How to exploit this range?`,
+      apiKey
+    );
     setFeedback(fb); setLoading(false);
   };
 
   return (
     <div>
-      <button onClick={deal} style={{width:"100%",background:"linear-gradient(135deg,#7c3aed,#6d28d9)",color:"#fff",border:"none",borderRadius:8,padding:"10px 0",fontSize:13,fontWeight:700,cursor:"pointer",marginBottom:10}}>Generate Spot</button>
+      <button onClick={deal} style={{width:"100%",background:"linear-gradient(135deg,#7c3aed,#6d28d9)",color:"#fff",border:"none",borderRadius:8,padding:"10px 0",fontSize:13,fontWeight:700,cursor:"pointer",marginBottom:10}}>Generate Range Spot</button>
       {state && (
         <div>
           <div style={{background:"#1e293b",borderRadius:10,padding:12,marginBottom:10}}>
@@ -292,20 +377,33 @@ function RangeModule({ apiKey }) {
               <span style={{color:"#a78bfa",fontWeight:700}}>{state.pos}</span> ({state.stack}) <span style={{color:"#94a3b8"}}>{state.action}</span>
             </div>
             <div style={{fontSize:11,color:"#64748b",marginBottom:4}}>Board:</div>
-            <div>{state.board.map((c,i)=><Card key={i} card={c} size={22}/>)}</div>
+            <div style={{marginBottom:6}}>{state.board.map((c,i)=><Card key={i} card={c} size={22}/>)}</div>
+            <div style={{fontSize:11,color:"#64748b"}}>What range does villain have here?</div>
           </div>
-          {!submitted && <>
-            <textarea value={guess} onChange={e=>setGuess(e.target.value)}
-              placeholder="e.g. AK, QQ+, maybe AQs bluff... excludes small pairs..."
-              style={{width:"100%",background:"#1e293b",border:"1px solid #334155",borderRadius:8,padding:10,color:"#e2e8f0",fontSize:12,minHeight:70,resize:"vertical",boxSizing:"border-box",outline:"none",lineHeight:1.5}}/>
-            <button onClick={submit} disabled={!guess.trim()} style={{width:"100%",marginTop:6,background:guess.trim()?"#7c3aed":"#334155",color:"#fff",border:"none",borderRadius:8,padding:"9px 0",fontSize:12,fontWeight:700,cursor:guess.trim()?"pointer":"not-allowed"}}>Submit Read</button>
-          </>}
-          {loading && <div style={{textAlign:"center",padding:12,color:"#64748b",fontSize:11}}>Evaluating...</div>}
-          {feedback && <div style={{background:"#1e293b",borderRadius:10,padding:12,marginTop:8,borderLeft:"3px solid #7c3aed"}}>
-            <div style={{fontSize:10,color:"#7c3aed",fontWeight:700,marginBottom:5,textTransform:"uppercase",letterSpacing:1}}>Coach</div>
-            <div style={{fontSize:12,color:"#e2e8f0",lineHeight:1.5}}>{feedback}</div>
-            <button onClick={deal} style={{marginTop:8,background:"#7c3aed",color:"#fff",border:"none",borderRadius:6,padding:"5px 14px",fontSize:11,fontWeight:700,cursor:"pointer"}}>Next →</button>
-          </div>}
+          {!submitted && (
+            <>
+              <textarea
+                value={guess}
+                onChange={e=>setGuess(e.target.value)}
+                placeholder="e.g. AK, QQ+, AQs, maybe KJs as a bluff... excludes small pairs..."
+                style={{width:"100%",background:"#1e293b",border:"1px solid #334155",borderRadius:8,padding:10,color:"#e2e8f0",fontSize:12,minHeight:70,resize:"vertical",boxSizing:"border-box",outline:"none",lineHeight:1.5}}
+              />
+              <button onClick={submit} disabled={!guess.trim()} style={{
+                width:"100%",marginTop:6,
+                background:guess.trim()?"#7c3aed":"#334155",
+                color:"#fff",border:"none",borderRadius:8,padding:"9px 0",fontSize:12,fontWeight:700,
+                cursor:guess.trim()?"pointer":"not-allowed"
+              }}>Submit Read</button>
+            </>
+          )}
+          {loading && <div style={{textAlign:"center",padding:12,color:"#64748b",fontSize:11}}>Evaluating your read...</div>}
+          {feedback && (
+            <div style={{background:"#1e293b",borderRadius:10,padding:12,marginTop:8,borderLeft:"3px solid #7c3aed"}}>
+              <div style={{fontSize:10,color:"#7c3aed",fontWeight:700,marginBottom:5,textTransform:"uppercase",letterSpacing:1}}>Coach</div>
+              <div style={{fontSize:12,color:"#e2e8f0",lineHeight:1.5}}>{feedback}</div>
+              <button onClick={deal} style={{marginTop:8,background:"#7c3aed",color:"#fff",border:"none",borderRadius:6,padding:"5px 14px",fontSize:11,fontWeight:700,cursor:"pointer"}}>Next →</button>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -327,16 +425,28 @@ function CallFoldModule({ apiKey }) {
     const bet = Math.floor(pot*(Math.random()*0.8+0.2));
     const stack = Math.floor(Math.random()*40)+5;
     const needed = Math.round(bet/(pot+bet*2)*100);
-    setState({ hand, board, pot, bet, stack, needed, villainPos: randFrom(POSITIONS), street: nCards===3?"Flop":nCards===4?"Turn":"River" });
+    // Hero is OOP, villain bets into them
+    const heroPos = randFrom(OOP_POSITIONS);
+    const villainPos = randFrom(IP_POSITIONS);
+    setState({
+      hand, board, pot, bet, stack, needed,
+      heroPos, villainPos,
+      street: nCards===3?"Flop":nCards===4?"Turn":"River"
+    });
     setChoice(null); setFeedback(null);
   };
 
   const decide = async (action) => {
     setChoice(action);
     setLoading(true);
-    const fb = await askClaude(`Call/Fold on ${state.street}: ${handStr(state.hand)} (${state.hand.join(" ")}). Board: ${state.board.join(" ")}. Pot: ${state.pot}BB. Villain bets ${state.bet}BB. Stack behind: ${state.stack}BB. Pot odds needed: ${state.needed}%. Chose: ${action}. Was this correct?`, apiKey);
-    setFeedback(fb);
-    setLoading(false);
+    const fb = await askClaude(
+      `Call/Fold decision on the ${state.street}. Hero at ${state.heroPos} (OOP) with ${handStr(state.hand)} (${state.hand.join(" ")}). ` +
+      `Board: ${state.board.join(" ")}. Pot: ${state.pot}BB. Villain (${state.villainPos}, IP) bets ${state.bet}BB. ` +
+      `Hero has ${state.stack}BB behind. Pot odds needed: ${state.needed}%. Hero chose: ${action}. ` +
+      `Evaluate: correct pot odds, hand equity vs villain's likely range, implied odds, stack depth. What is the correct play?`,
+      apiKey
+    );
+    setFeedback(fb); setLoading(false);
   };
 
   return (
@@ -345,10 +455,12 @@ function CallFoldModule({ apiKey }) {
       {state && (
         <div>
           <div style={{background:"#1e293b",borderRadius:10,padding:12,marginBottom:10}}>
-            <div style={{fontSize:10,color:"#d97706",textTransform:"uppercase",letterSpacing:1,marginBottom:8}}>{state.street}</div>
+            <div style={{fontSize:10,color:"#d97706",textTransform:"uppercase",letterSpacing:1,marginBottom:8}}>
+              {state.street} — You ({state.heroPos}) vs Villain ({state.villainPos})
+            </div>
             <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
               <div>
-                <div style={{fontSize:10,color:"#64748b",marginBottom:3}}>Hand</div>
+                <div style={{fontSize:10,color:"#64748b",marginBottom:3}}>Your Hand</div>
                 <div>{state.hand.map((c,i)=><Card key={i} card={c}/>)}</div>
                 <div style={{fontSize:11,color:"#94a3b8",marginTop:2}}>{handStr(state.hand)}</div>
               </div>
@@ -358,10 +470,11 @@ function CallFoldModule({ apiKey }) {
               </div>
             </div>
             <div style={{textAlign:"center",marginBottom:8}}>
+              <div style={{fontSize:10,color:"#64748b",marginBottom:4}}>Board</div>
               <div>{state.board.map((c,i)=><Card key={i} card={c} size={22}/>)}</div>
             </div>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:5}}>
-              {[{l:"Pot",v:`${state.pot}BB`},{l:`${state.villainPos} Bets`,v:`${state.bet}BB`},{l:"Need",v:`${state.needed}%`}].map(({l,v})=>(
+              {[{l:"Pot",v:`${state.pot}BB`},{l:"Villain Bets",v:`${state.bet}BB`},{l:"Need Equity",v:`${state.needed}%`}].map(({l,v})=>(
                 <div key={l} style={{background:"#0f172a",borderRadius:6,padding:6,textAlign:"center"}}>
                   <div style={{fontSize:13,fontWeight:700,color:"#fbbf24"}}>{v}</div>
                   <div style={{fontSize:9,color:"#64748b"}}>{l}</div>
@@ -369,17 +482,21 @@ function CallFoldModule({ apiKey }) {
               ))}
             </div>
           </div>
-          {!choice && <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6}}>
-            {[["Fold","#7f1d1d"],["Call","#d97706"],["Raise","#16a34a"]].map(([label,color])=>(
-              <button key={label} onClick={()=>decide(label)} style={{background:color,color:"#fff",border:"none",borderRadius:8,padding:"10px 0",fontSize:12,fontWeight:700,cursor:"pointer"}}>{label}</button>
-            ))}
-          </div>}
+          {!choice && (
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6}}>
+              {[["Fold","#7f1d1d"],["Call","#d97706"],["Raise","#16a34a"]].map(([label,color])=>(
+                <button key={label} onClick={()=>decide(label)} style={{background:color,color:"#fff",border:"none",borderRadius:8,padding:"10px 0",fontSize:12,fontWeight:700,cursor:"pointer"}}>{label}</button>
+              ))}
+            </div>
+          )}
           {loading && <div style={{textAlign:"center",padding:12,color:"#64748b",fontSize:11}}>Calculating...</div>}
-          {feedback && <div style={{background:"#1e293b",borderRadius:10,padding:12,marginTop:8,borderLeft:"3px solid #d97706"}}>
-            <div style={{fontSize:10,color:"#d97706",fontWeight:700,marginBottom:5,textTransform:"uppercase",letterSpacing:1}}>Coach</div>
-            <div style={{fontSize:12,color:"#e2e8f0",lineHeight:1.5}}>{feedback}</div>
-            <button onClick={deal} style={{marginTop:8,background:"#d97706",color:"#fff",border:"none",borderRadius:6,padding:"5px 14px",fontSize:11,fontWeight:700,cursor:"pointer"}}>Next →</button>
-          </div>}
+          {feedback && (
+            <div style={{background:"#1e293b",borderRadius:10,padding:12,marginTop:8,borderLeft:"3px solid #d97706"}}>
+              <div style={{fontSize:10,color:"#d97706",fontWeight:700,marginBottom:5,textTransform:"uppercase",letterSpacing:1}}>Coach</div>
+              <div style={{fontSize:12,color:"#e2e8f0",lineHeight:1.5}}>{feedback}</div>
+              <button onClick={deal} style={{marginTop:8,background:"#d97706",color:"#fff",border:"none",borderRadius:6,padding:"5px 14px",fontSize:11,fontWeight:700,cursor:"pointer"}}>Next →</button>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -394,16 +511,24 @@ function BluffModule({ apiKey }) {
   const [loading, setLoading] = useState(false);
 
   const deal = () => {
-    const heroPos = randFrom(["BTN","CO","SB","BB"]);
+    // Bluff spots work best when hero is in position
+    const heroPos = randFrom(IP_POSITIONS);
     const hand = randHand();
     const nCards = randFrom([3,4,5]);
+    const villainPos = getVillainPos(heroPos);
     setState({
       heroPos, hand,
       board: randBoard(nCards, hand),
       pot: Math.floor(Math.random()*25)+8,
       stack: Math.floor(Math.random()*35)+10,
-      villainPos: randFrom(POSITIONS.filter(p=>p!==heroPos)),
-      villainAction: randFrom(["checked","bet small then checked turn","checked twice","showed weakness all streets"]),
+      villainPos,
+      villainAction: randFrom([
+        "checked to you",
+        "bet small then checked turn",
+        "checked twice",
+        "showed weakness on all streets",
+        "checked and called small, now checked again",
+      ]),
     });
     setChoice(null); setFeedback(null);
   };
@@ -411,9 +536,15 @@ function BluffModule({ apiKey }) {
   const decide = async (action) => {
     setChoice(action);
     setLoading(true);
-    const fb = await askClaude(`Bluff spot: ${state.heroPos} with ${handStr(state.hand)} (${state.hand.join(" ")}). Board: ${state.board.join(" ")}. Pot: ${state.pot}BB, stack: ${state.stack}BB. Villain (${state.villainPos}) ${state.villainAction}. Chose: ${action}. Good bluff spot? Range perception? Correct sizing?`, apiKey);
-    setFeedback(fb);
-    setLoading(false);
+    const fb = await askClaude(
+      `Bluff spot: Hero at ${state.heroPos} (in position) with ${handStr(state.hand)} (${state.hand.join(" ")}). ` +
+      `Board: ${state.board.join(" ")}. Pot: ${state.pot}BB, stack behind: ${state.stack}BB. ` +
+      `Villain (${state.villainPos}) ${state.villainAction}. Hero chose: ${action}. ` +
+      `Evaluate: Is this a profitable bluff spot? What does hero's range look like here? ` +
+      `Does the board favour hero's range? What sizing is correct and why?`,
+      apiKey
+    );
+    setFeedback(fb); setLoading(false);
   };
 
   return (
@@ -422,10 +553,12 @@ function BluffModule({ apiKey }) {
       {state && (
         <div>
           <div style={{background:"#1e293b",borderRadius:10,padding:12,marginBottom:10}}>
-            <div style={{fontSize:10,color:"#dc2626",textTransform:"uppercase",letterSpacing:1,marginBottom:8}}>Bluff Opportunity?</div>
+            <div style={{fontSize:10,color:"#dc2626",textTransform:"uppercase",letterSpacing:1,marginBottom:8}}>
+              Bluff Opportunity? — You at {state.heroPos} (IP)
+            </div>
             <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
               <div>
-                <div style={{fontSize:10,color:"#64748b",marginBottom:3}}>Hand at {state.heroPos}</div>
+                <div style={{fontSize:10,color:"#64748b",marginBottom:3}}>Your Hand</div>
                 <div>{state.hand.map((c,i)=><Card key={i} card={c}/>)}</div>
                 <div style={{fontSize:11,color:"#94a3b8",marginTop:2}}>{handStr(state.hand)}</div>
               </div>
@@ -441,17 +574,25 @@ function BluffModule({ apiKey }) {
               Villain ({state.villainPos}) <span style={{color:"#fbbf24",fontWeight:600}}>{state.villainAction}</span>
             </div>
           </div>
-          {!choice && <div style={{display:"flex",flexDirection:"column",gap:5}}>
-            {["Check/Give Up","Small (1/3)","Half Pot","Pot Bet","Jam"].map(a=>(
-              <button key={a} onClick={()=>decide(a)} style={{background:a==="Check/Give Up"?"#1e293b":"#dc2626",color:a==="Check/Give Up"?"#94a3b8":"#fff",border:"1px solid #334155",borderRadius:7,padding:"8px 0",fontSize:12,fontWeight:700,cursor:"pointer"}}>{a}</button>
-            ))}
-          </div>}
-          {loading && <div style={{textAlign:"center",padding:12,color:"#64748b",fontSize:11}}>Evaluating...</div>}
-          {feedback && <div style={{background:"#1e293b",borderRadius:10,padding:12,marginTop:8,borderLeft:"3px solid #dc2626"}}>
-            <div style={{fontSize:10,color:"#dc2626",fontWeight:700,marginBottom:5,textTransform:"uppercase",letterSpacing:1}}>Coach</div>
-            <div style={{fontSize:12,color:"#e2e8f0",lineHeight:1.5}}>{feedback}</div>
-            <button onClick={deal} style={{marginTop:8,background:"#dc2626",color:"#fff",border:"none",borderRadius:6,padding:"5px 14px",fontSize:11,fontWeight:700,cursor:"pointer"}}>Next →</button>
-          </div>}
+          {!choice && (
+            <div style={{display:"flex",flexDirection:"column",gap:5}}>
+              {["Check/Give Up","Small Bluff (1/3)","Half Pot Bluff","Pot Bluff","Jam"].map(a=>(
+                <button key={a} onClick={()=>decide(a)} style={{
+                  background:a==="Check/Give Up"?"#1e293b":"#dc2626",
+                  color:a==="Check/Give Up"?"#94a3b8":"#fff",
+                  border:"1px solid #334155",borderRadius:7,padding:"9px 0",fontSize:12,fontWeight:700,cursor:"pointer"
+                }}>{a}</button>
+              ))}
+            </div>
+          )}
+          {loading && <div style={{textAlign:"center",padding:12,color:"#64748b",fontSize:11}}>Evaluating bluff spot...</div>}
+          {feedback && (
+            <div style={{background:"#1e293b",borderRadius:10,padding:12,marginTop:8,borderLeft:"3px solid #dc2626"}}>
+              <div style={{fontSize:10,color:"#dc2626",fontWeight:700,marginBottom:5,textTransform:"uppercase",letterSpacing:1}}>Coach</div>
+              <div style={{fontSize:12,color:"#e2e8f0",lineHeight:1.5}}>{feedback}</div>
+              <button onClick={deal} style={{marginTop:8,background:"#dc2626",color:"#fff",border:"none",borderRadius:6,padding:"5px 14px",fontSize:11,fontWeight:700,cursor:"pointer"}}>Next →</button>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -471,47 +612,87 @@ function ScenarioModule({ apiKey }) {
   const [feedback, setFeedback] = useState(null);
   const [loading, setLoading] = useState(false);
   const [done, setDone] = useState(false);
+  const [heroIsIP, setHeroIsIP] = useState(true);
 
   const startHand = () => {
-    const hp = randFrom(POSITIONS);
-    const vp = randFrom(POSITIONS.filter(p=>p!==hp));
+    // Randomly decide if hero is IP or OOP
+    const ip = Math.random() > 0.4; // 60% chance hero is IP (more common in scenarios)
+    const hp = ip ? randFrom(IP_POSITIONS) : randFrom(OOP_POSITIONS);
+    const vp = getVillainPos(hp);
     const stack = Math.floor(Math.random()*60)+15;
-    setHand(randHand()); setHeroPos(hp); setVillainPos(vp);
-    setHeroStack(stack); setPot(1.5); setBoard([]);
-    setStreet("preflop"); setHistory([]); setFeedback(null); setDone(false);
+    setHand(randHand());
+    setHeroPos(hp); setVillainPos(vp);
+    setHeroStack(stack); setPot(1.5);
+    setBoard([]); setStreet("preflop");
+    setHistory([]); setFeedback(null); setDone(false);
+    setHeroIsIP(ip);
   };
 
   const makeChoice = async (action) => {
     setLoading(true);
     const newHistory = [...history, { street, action }];
     setHistory(newHistory);
+
     let nextStreet = street, newBoard = [...board], newPot = pot;
-    if(street==="preflop") { nextStreet="flop"; newBoard=randBoard(3,hand); newPot=action.includes("Raise")||action.includes("3")?pot*3:action==="Call"?pot*2:pot; }
-    else if(street==="flop") { nextStreet="turn"; newBoard=[...board,...randBoard(1,[...hand,...board])]; newPot=action.includes("Bet")||action.includes("Raise")?pot*1.8:pot; }
-    else if(street==="turn") { nextStreet="river"; newBoard=[...board,...randBoard(1,[...hand,...board])]; newPot=action.includes("Bet")||action.includes("Raise")?pot*1.8:pot; }
-    else { nextStreet="done"; setDone(true); }
+    if(street==="preflop") {
+      nextStreet="flop";
+      newBoard = randBoard(3, hand);
+      newPot = action.includes("Raise")||action.includes("3")||action.includes("Jam") ? pot*3 : action==="Call" ? pot*2 : pot;
+    } else if(street==="flop") {
+      nextStreet="turn";
+      newBoard = [...board, ...randBoard(1,[...hand,...board])];
+      newPot = action.includes("Bet")||action.includes("Raise")||action.includes("Jam") ? pot*1.8 : pot;
+    } else if(street==="turn") {
+      nextStreet="river";
+      newBoard = [...board, ...randBoard(1,[...hand,...board])];
+      newPot = action.includes("Bet")||action.includes("Raise")||action.includes("Jam") ? pot*1.8 : pot;
+    } else {
+      nextStreet="done";
+      setDone(true);
+    }
+
     setBoard(newBoard); setStreet(nextStreet); setPot(Math.round(newPot*10)/10);
-    const histStr = newHistory.map(h=>`${h.street}:${h.action}`).join(", ");
-    const fb = await askClaude(`Full hand feedback. Hero: ${heroPos}, ${hand?handStr(hand):""} (${hand?.join(" ")}), ${heroStack}BB. Villain: ${villainPos}. History: ${histStr}. Board: ${newBoard.join(" ")}. Pot: ${newPot.toFixed(1)}BB. Evaluate the ${street} action "${action}" and give one key tip for ${nextStreet}.`, apiKey);
+
+    const histStr = newHistory.map(h=>`${h.street}: ${h.action}`).join(", ");
+    const posContext = heroIsIP
+      ? `Hero at ${heroPos} is IN POSITION (acts last postflop)`
+      : `Hero at ${heroPos} is OUT OF POSITION (acts first postflop)`;
+
+    const fb = await askClaude(
+      `Full hand review. ${posContext}. Hand: ${hand?handStr(hand):""} (${hand?.join(" ")}). ${heroStack}BB stack. ` +
+      `Villain: ${villainPos}. Hand history: ${histStr}. Board: ${newBoard.join(" ")}. Pot: ${newPot.toFixed(1)}BB. ` +
+      `Evaluate the ${street} action "${action}". Was it correct? Key tip for ${nextStreet}.`,
+      apiKey
+    );
     setFeedback(fb); setLoading(false);
   };
 
-  const streets = ["preflop","flop","turn","river","done"];
+  const streets = ["preflop","flop","turn","river"];
+
   const getActions = () => {
     if(street==="preflop") return ["Fold","Call","Raise 2.5BB","3-Bet","Jam"];
-    if(street==="done") return [];
-    return ["Check","Fold","Bet 1/3","Bet 1/2","Bet 2/3","Jam"];
+    if(done) return [];
+    // Show appropriate actions based on position
+    if(heroIsIP) {
+      return ["Check Back","Bet 1/3","Bet 1/2","Bet 2/3","Jam"];
+    } else {
+      return ["Check","Fold to Bet","Call Bet","Lead 1/3","Lead 1/2","Jam"];
+    }
   };
 
   return (
     <div>
-      <button onClick={startHand} style={{width:"100%",background:"linear-gradient(135deg,#0891b2,#0e7490)",color:"#fff",border:"none",borderRadius:8,padding:"10px 0",fontSize:13,fontWeight:700,cursor:"pointer",marginBottom:10}}>{hand?"New Hand":"Deal Hand"}</button>
+      <button onClick={startHand} style={{width:"100%",background:"linear-gradient(135deg,#0891b2,#0e7490)",color:"#fff",border:"none",borderRadius:8,padding:"10px 0",fontSize:13,fontWeight:700,cursor:"pointer",marginBottom:10}}>
+        {hand ? "New Hand" : "Deal Hand"}
+      </button>
       {hand && (
         <div>
           <div style={{background:"#1e293b",borderRadius:10,padding:12,marginBottom:10}}>
             <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
               <div>
-                <div style={{fontSize:10,color:"#64748b",marginBottom:3}}>{heroPos} vs {villainPos}</div>
+                <div style={{fontSize:10,color:"#64748b",marginBottom:3}}>
+                  {heroPos} ({heroIsIP?"IP — acts last":"OOP — acts first"}) vs {villainPos}
+                </div>
                 <div>{hand.map((c,i)=><Card key={i} card={c}/>)}</div>
                 <div style={{fontSize:11,color:"#94a3b8",marginTop:2}}>{handStr(hand)}</div>
               </div>
@@ -521,13 +702,25 @@ function ScenarioModule({ apiKey }) {
                 <div style={{fontSize:12,color:"#fbbf24"}}>{pot}BB</div>
               </div>
             </div>
-            {board.length>0 && <div style={{textAlign:"center",marginBottom:8}}><div>{board.map((c,i)=><Card key={i} card={c} size={22}/>)}</div></div>}
+            {board.length>0 && (
+              <div style={{textAlign:"center",marginBottom:8}}>
+                <div style={{fontSize:10,color:"#64748b",marginBottom:4}}>
+                  {board.length===3?"Flop":board.length===4?"Turn":"River"}
+                </div>
+                <div>{board.map((c,i)=><Card key={i} card={c} size={22}/>)}</div>
+              </div>
+            )}
             <div style={{display:"flex",justifyContent:"center",gap:5}}>
-              {streets.slice(0,-1).map(s=>(
-                <div key={s} style={{width:7,height:7,borderRadius:"50%",background:street===s?"#16a34a":streets.indexOf(s)<streets.indexOf(street)?"#334155":"#1e293b",border:`1px solid ${street===s?"#16a34a":"#334155"}`}}/>
+              {streets.map(s=>(
+                <div key={s} style={{
+                  width:7,height:7,borderRadius:"50%",
+                  background:street===s?"#16a34a":streets.indexOf(s)<streets.indexOf(street)?"#334155":"#1e293b",
+                  border:`1px solid ${street===s?"#16a34a":"#334155"}`
+                }}/>
               ))}
             </div>
           </div>
+
           {history.length>0 && (
             <div style={{background:"#0f172a",borderRadius:8,padding:8,marginBottom:8}}>
               {history.map((h,i)=>(
@@ -537,22 +730,38 @@ function ScenarioModule({ apiKey }) {
               ))}
             </div>
           )}
-          {feedback && <div style={{background:"#1e293b",borderRadius:10,padding:12,marginBottom:8,borderLeft:"3px solid #0891b2"}}>
-            <div style={{fontSize:10,color:"#0891b2",fontWeight:700,marginBottom:5,textTransform:"uppercase",letterSpacing:1}}>Coach</div>
-            <div style={{fontSize:12,color:"#e2e8f0",lineHeight:1.5}}>{feedback}</div>
-          </div>}
+
+          {feedback && (
+            <div style={{background:"#1e293b",borderRadius:10,padding:12,marginBottom:8,borderLeft:"3px solid #0891b2"}}>
+              <div style={{fontSize:10,color:"#0891b2",fontWeight:700,marginBottom:5,textTransform:"uppercase",letterSpacing:1}}>
+                {done ? "Final Analysis" : "Street Feedback"}
+              </div>
+              <div style={{fontSize:12,color:"#e2e8f0",lineHeight:1.5}}>{feedback}</div>
+            </div>
+          )}
+
           {loading && <div style={{textAlign:"center",padding:12,color:"#64748b",fontSize:11}}>Analysing...</div>}
+
           {!done && !loading && (
             <div>
-              <div style={{fontSize:10,color:"#64748b",marginBottom:5,textTransform:"uppercase",letterSpacing:1}}>{street.charAt(0).toUpperCase()+street.slice(1)} Action</div>
+              <div style={{fontSize:10,color:"#64748b",marginBottom:5,textTransform:"uppercase",letterSpacing:1}}>
+                {street.charAt(0).toUpperCase()+street.slice(1)} — Your Action
+              </div>
               <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:5}}>
                 {getActions().map(a=>(
-                  <button key={a} onClick={()=>makeChoice(a)} style={{background:a==="Fold"?"#7f1d1d":a==="Check"?"#1e293b":a.includes("Jam")?"#7c3aed":"#16a34a",color:a==="Check"?"#94a3b8":"#fff",border:"1px solid #334155",borderRadius:7,padding:"8px 4px",fontSize:11,fontWeight:700,cursor:"pointer"}}>{a}</button>
+                  <button key={a} onClick={()=>makeChoice(a)} style={{
+                    background:a.includes("Fold")?"#7f1d1d":a.includes("Check")?"#1e293b":a.includes("Jam")?"#7c3aed":"#16a34a",
+                    color:a.includes("Check")?"#94a3b8":"#fff",
+                    border:"1px solid #334155",borderRadius:7,padding:"8px 4px",fontSize:10,fontWeight:700,cursor:"pointer"
+                  }}>{a}</button>
                 ))}
               </div>
             </div>
           )}
-          {done && <button onClick={startHand} style={{width:"100%",marginTop:8,background:"#0891b2",color:"#fff",border:"none",borderRadius:8,padding:"10px 0",fontSize:13,fontWeight:700,cursor:"pointer"}}>New Hand →</button>}
+
+          {done && (
+            <button onClick={startHand} style={{width:"100%",marginTop:8,background:"#0891b2",color:"#fff",border:"none",borderRadius:8,padding:"10px 0",fontSize:13,fontWeight:700,cursor:"pointer"}}>New Hand →</button>
+          )}
         </div>
       )}
     </div>
@@ -568,7 +777,14 @@ export default function PokerTrainer() {
   if(showSettings) return <Settings apiKey={apiKey} setApiKey={setApiKey} onClose={()=>setShowSettings(false)}/>;
 
   return (
-    <div style={{background:"#0f172a",minHeight:"100vh",color:"#e2e8f0",fontFamily:"'Inter','Helvetica Neue',sans-serif",padding:16,maxWidth:480,margin:"0 auto"}}>
+    <div style={{
+      background:"#0f172a",minHeight:"100vh",
+      color:"#e2e8f0",
+      fontFamily:"'Inter','SF Pro Display','Helvetica Neue',sans-serif",
+      padding:16,
+      maxWidth:520,
+      margin:"0 auto",
+    }}>
       {/* Header */}
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14}}>
         <div>
@@ -578,15 +794,20 @@ export default function PokerTrainer() {
           </div>
           <div style={{fontSize:10,color:"#475569"}}>AI-powered drills tailored to your leaks</div>
         </div>
-        <button onClick={()=>setShowSettings(true)} style={{background:"#1e293b",border:`1px solid ${apiKey?"#16a34a":"#ef4444"}`,color:apiKey?"#16a34a":"#ef4444",borderRadius:7,padding:"6px 10px",fontSize:11,cursor:"pointer",fontWeight:600}}>
-          {apiKey?"✓ API":"⚙️ Setup"}
+        <button onClick={()=>setShowSettings(true)} style={{
+          background:"#1e293b",
+          border:`1px solid ${apiKey?"#16a34a":"#ef4444"}`,
+          color:apiKey?"#16a34a":"#ef4444",
+          borderRadius:7,padding:"6px 10px",fontSize:11,cursor:"pointer",fontWeight:600
+        }}>
+          {apiKey ? "✓ API" : "⚙️ Setup"}
         </button>
       </div>
 
       {/* API warning */}
       {!apiKey && (
         <div style={{background:"#7f1d1d",borderRadius:8,padding:10,marginBottom:12,fontSize:11,color:"#fca5a5",lineHeight:1.5}}>
-          ⚠️ No API key set — tap <strong>Setup</strong> to add your Anthropic API key. Without it, feedback won't work.
+          ⚠️ No API key — tap <strong>Setup</strong> to add your Anthropic API key and enable AI coaching.
         </div>
       )}
 
@@ -594,18 +815,30 @@ export default function PokerTrainer() {
         <div>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
             {MODULES.map(m=>(
-              <button key={m.id} onClick={()=>setActiveModule(m.id)} style={{background:"#1e293b",border:"1px solid #334155",borderRadius:10,padding:14,textAlign:"left",cursor:"pointer"}}
+              <button
+                key={m.id}
+                onClick={()=>setActiveModule(m.id)}
+                style={{background:"#1e293b",border:"1px solid #334155",borderRadius:10,padding:14,textAlign:"left",cursor:"pointer",transition:"border-color 0.15s"}}
                 onMouseEnter={e=>e.currentTarget.style.borderColor="#16a34a"}
-                onMouseLeave={e=>e.currentTarget.style.borderColor="#334155"}>
+                onMouseLeave={e=>e.currentTarget.style.borderColor="#334155"}
+              >
                 <div style={{fontSize:22,marginBottom:5}}>{m.icon}</div>
                 <div style={{fontSize:12,fontWeight:700,color:"#f8fafc",marginBottom:2}}>{m.label}</div>
                 <div style={{fontSize:10,color:"#64748b",lineHeight:1.4}}>{m.desc}</div>
               </button>
             ))}
           </div>
+
+          {/* Known leaks */}
           <div style={{background:"#1e293b",borderRadius:10,padding:12}}>
             <div style={{fontSize:10,color:"#dc2626",fontWeight:700,marginBottom:6,textTransform:"uppercase",letterSpacing:1}}>Your Known Leaks</div>
-            {["Calling too much preflop — VPIP/PFR gap","Missing BTN/CO steal spots","SB not raising vs late position steals","Trash hand shoves when short stacked","Top pair weak kicker — going too far"].map((l,i)=>(
+            {[
+              "Calling too much preflop — VPIP/PFR gap too wide",
+              "Missing BTN/CO steal spots when folded to you",
+              "SB not raising vs late position steals",
+              "Trash hand shoves when short stacked",
+              "Top pair weak kicker — going too far vs aggression",
+            ].map((l,i)=>(
               <div key={i} style={{fontSize:11,color:"#94a3b8",marginBottom:3,paddingLeft:8,borderLeft:"2px solid #dc2626"}}>{l}</div>
             ))}
           </div>
@@ -615,7 +848,9 @@ export default function PokerTrainer() {
           <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12}}>
             <button onClick={()=>setActiveModule(null)} style={{background:"#1e293b",border:"1px solid #334155",color:"#94a3b8",borderRadius:6,padding:"5px 10px",fontSize:11,cursor:"pointer"}}>← Back</button>
             <div>
-              <div style={{fontSize:13,fontWeight:700,color:"#f8fafc"}}>{MODULES.find(m=>m.id===activeModule)?.icon} {MODULES.find(m=>m.id===activeModule)?.label}</div>
+              <div style={{fontSize:13,fontWeight:700,color:"#f8fafc"}}>
+                {MODULES.find(m=>m.id===activeModule)?.icon} {MODULES.find(m=>m.id===activeModule)?.label}
+              </div>
               <div style={{fontSize:10,color:"#64748b"}}>{MODULES.find(m=>m.id===activeModule)?.desc}</div>
             </div>
           </div>
@@ -627,6 +862,10 @@ export default function PokerTrainer() {
           {activeModule==="scenario" && <ScenarioModule apiKey={apiKey}/>}
         </div>
       )}
+
+      <div style={{marginTop:16,textAlign:"center",fontSize:10,color:"#1e293b"}}>
+        Powered by Claude Sonnet 4.6
+      </div>
     </div>
   );
 }
