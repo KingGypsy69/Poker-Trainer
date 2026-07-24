@@ -191,20 +191,20 @@ function RangeGrid({ cellStates={}, onCellClick=null, showLegend=true, title="" 
       </div>
       {showLegend && (
         <div style={{display:"flex",flexWrap:"wrap",gap:6,marginTop:6}}>
-          {onCellClick ? [
-            {color:"#22c55e",label:"Definitely in"},
-            {color:"#fbbf24",label:"Possibly in"},
-            {color:"#1e293b",label:"Not in range"},
-          ] : [
-            {color:"#16a34a",label:"In range"},
-            {color:"#d97706",label:"Possible"},
-            {color:"#1e293b",label:"Eliminated"},
-          ]}.map(({color,label})=>(
-            <div key={label} style={{display:"flex",alignItems:"center",gap:3}}>
-              <div style={{width:10,height:10,borderRadius:2,background:color,border:"1px solid #334155"}}/>
-              <span style={{fontSize:9,color:"#64748b"}}>{label}</span>
-            </div>
-          ))}
+        {(onCellClick ? [
+  {color:"#22c55e",label:"Definitely in"},
+  {color:"#fbbf24",label:"Possibly in"},
+  {color:"#1e293b",label:"Not in range"},
+] : [
+  {color:"#16a34a",label:"In range"},
+  {color:"#d97706",label:"Possible"},
+  {color:"#1e293b",label:"Eliminated"},
+]).map(({color,label})=>(
+  <div key={label} style={{display:"flex",alignItems:"center",gap:3}}>
+    <div style={{width:10,height:10,borderRadius:2,background:color,border:"1px solid #334155"}}/>
+    <span style={{fontSize:9,color:"#64748b"}}>{label}</span>
+  </div>
+))}
         </div>
       )}
     </div>
